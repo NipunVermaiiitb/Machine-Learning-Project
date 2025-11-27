@@ -101,12 +101,12 @@ Run Jupyter Notebooks:
 Each project contains notebooks for EDA, preprocessing, training and evaluation.
 
 Run Training Scripts:
-python Binary_Classification/src/train.py
+python Binary_Classification/src/model.py
 
 -------------------------
 Reports:
-Binary_Classification/report.pdf
-Multiclass_Classification/report.pdf
+ML_Binary.pdf
+ML_Multi.pdf
 
 -------------------------
 Summary:
