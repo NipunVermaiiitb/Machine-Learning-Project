@@ -1,0 +1,269 @@
+import pandas as pd
+import numpy as np
+import sklearn
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, FunctionTransformer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import f1_score, roc_auc_score, confusion_matrix
+from catboost import CatBoostClassifier
+
+# ======================================================
+# 1) Load TRAIN and EXTERNAL TEST CSVs
+# ======================================================
+
+train_path = "/kaggle/input/start-up-founder-retention-prediction/train.csv"
+test_path  = "/kaggle/input/start-up-founder-retention-prediction/test.csv"
+
+df = pd.read_csv(train_path)
+df_ext_test = pd.read_csv(test_path)
+df = df.drop_duplicates()
+
+# ======================================================
+# 2) FIXED COLUMN GROUPS
+# ======================================================
+
+numeric_cols = [
+    "founder_id",
+    "founder_age",
+    "years_with_startup",
+    "monthly_revenue_generated",
+    "funding_rounds_led",
+    "distance_from_investor_hub",
+    "num_dependents"
+]
+
+categorical_cols = [
+    "founder_gender",
+    "founder_role",
+    "work_life_balance_rating",
+    "venture_satisfaction",
+    "startup_performance_rating",
+    "education_background",
+    "personal_status",
+    "startup_stage",
+    "team_size_category",
+    "years_since_founding",
+    "innovation_support",
+    "startup_reputation",
+    "founder_visibility",
+]
+
+boolean_cols = [
+    "working_overtime",
+    "remote_operations",
+    "leadership_scope"
+]
+
+target_col = "retention_status"
+
+# ======================================================
+# 3) Normalize Booleans (handles messy labels)
+# ======================================================
+
+def normalize_boolean(col):
+    return (
+        col.astype(str)
+           .str.strip()
+           .str.lower()
+           .map({
+               "true": 1, "false": 0,
+               "yes": 1, "no": 0,
+               "1": 1, "0": 0
+           })
+           .astype("Int64")
+    )
+
+# TRAIN
+for col in boolean_cols:
+    df[col] = normalize_boolean(df[col])
+
+# EXTERNAL TEST
+for col in boolean_cols:
+    if col in df_ext_test.columns:
+        df_ext_test[col] = normalize_boolean(df_ext_test[col])
+
+# Convert target
+df[target_col] = df[target_col].map({"Stayed": 1, "Left": 0})
+
+# ======================================================
+# 4) IDENTIFY AND REMOVE REDUNDANT COLUMNS
+# ======================================================
+
+cols_to_drop = []
+
+# A) Near-zero variance columns
+for col in numeric_cols + categorical_cols + boolean_cols:
+    if df[col].nunique() <= 1:
+        cols_to_drop.append(col)
+
+# B) High-correlation numeric columns
+numerics_df = df[numeric_cols].astype(float)
+corr_matrix = numerics_df.corr().abs()
+upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+high_corr_cols = [col for col in upper_tri.columns if any(upper_tri[col] > 0.95)]
+cols_to_drop += high_corr_cols
+
+cols_to_drop = list(set(cols_to_drop))
+
+print("\n===== REDUNDANT COLUMNS REMOVED =====")
+print(cols_to_drop)
+
+# Remove redundant columns
+df = df.drop(columns=cols_to_drop)
+df_ext_test = df_ext_test.drop(columns=cols_to_drop, errors="ignore")
+
+numeric_cols = [col for col in numeric_cols if col not in cols_to_drop]
+categorical_cols = [col for col in categorical_cols if col not in cols_to_drop]
+boolean_cols = [col for col in boolean_cols if col not in cols_to_drop]
+
+# ======================================================
+# 5) REMOVE founder_id FROM ALL MODEL INPUTS
+# ======================================================
+
+founder_id_test = df_ext_test["founder_id"].copy()   # save for submission
+
+numeric_cols = [c for c in numeric_cols if c != "founder_id"]
+
+df = df.drop(columns=["founder_id"])
+df_ext_test = df_ext_test.drop(columns=["founder_id"])
+
+# ======================================================
+# 6) 80:20 SPLIT FOR VALIDATION
+# ======================================================
+
+X = df.drop(columns=[target_col])
+y = df[target_col]
+
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.20, random_state=42, stratify=y
+)
+
+# ======================================================
+# 7) PREPROCESSING PIPELINES
+# ======================================================
+
+skewed_numeric_cols = ["monthly_revenue_generated", "distance_from_investor_hub"]
+skewed_numeric_cols = [col for col in skewed_numeric_cols if col in numeric_cols]
+skew_indices = [numeric_cols.index(c) for c in skewed_numeric_cols]
+
+def log_transform_selected(X):
+    X = X.copy().astype(float)
+    for idx in skew_indices:
+        col = X[:, idx]
+        col = np.where(col < 0, 0.0, col)
+        X[:, idx] = np.log1p(col)
+    return X
+
+numeric_pipeline = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="median")),
+    ("log", FunctionTransformer(log_transform_selected, validate=False)),
+    ("scaler", StandardScaler())
+])
+
+def make_ohe():
+    if sklearn.__version__ >= "1.2":
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    else:
+        return OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+categorical_pipeline = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("ohe", make_ohe())
+])
+
+boolean_pipeline = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent"))
+])
+
+preprocessor = ColumnTransformer(transformers=[
+    ("num", numeric_pipeline, numeric_cols),
+    ("cat", categorical_pipeline, categorical_cols),
+    ("bool", boolean_pipeline, boolean_cols)
+])
+
+# ======================================================
+# 8) CATBOOST MODEL (Replaces XGBoost)
+# ======================================================
+
+cat_model = CatBoostClassifier(
+    iterations=600,
+    depth=6,
+    learning_rate=0.03,
+    random_state=42,
+    loss_function="Logloss",
+    verbose=False,
+    task_type="CPU"
+)
+
+clf = Pipeline(steps=[
+    ("preprocess", preprocessor),
+    ("model", cat_model)
+])
+
+clf.fit(X_train, y_train)
+
+# ======================================================
+# 9) STRATIFIED K-FOLD VALIDATION
+# ======================================================
+
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+fold_f1, fold_auc = [], []
+combined_cm = np.zeros((2, 2), dtype=int)
+
+X_val_df = X_val.reset_index(drop=True)
+y_val_arr = y_val.reset_index(drop=True).to_numpy()
+
+print("\n===== Validation (20%) with K-Fold =====")
+for i, (_, val_idx) in enumerate(skf.split(X_val_df, y_val_arr), 1):
+    X_fold = X_val_df.iloc[val_idx]
+    y_fold = y_val_arr[val_idx]
+
+    y_pred = clf.predict(X_fold)
+    y_prob = clf.predict_proba(X_fold)[:, 1]
+
+    f1 = f1_score(y_fold, y_pred)
+    auc = roc_auc_score(y_fold, y_prob)
+    cm = confusion_matrix(y_fold, y_pred)
+
+    fold_f1.append(f1)
+    fold_auc.append(auc)
+    combined_cm += cm
+
+    print(f"\nFold {i} → F1={f1:.4f}, AUC={auc:.4f}")
+    print(cm)
+
+print("\n===== FINAL VALIDATION METRICS =====")
+print("Average F1:", np.mean(fold_f1))
+print("Average AUC:", np.mean(fold_auc))
+print("Combined CM:\n", combined_cm)
+
+# ======================================================
+# 10) RETRAIN CATBOOST ON FULL TRAIN.CSV
+# ======================================================
+
+clf_full = Pipeline(steps=[
+    ("preprocess", preprocessor),
+    ("model", cat_model)
+])
+
+clf_full.fit(X, y)
+print("\nModel retrained on FULL train.csv ✔")
+
+# ======================================================
+# 11) PREDICT ON EXTERNAL TEST & EXPORT CSV
+# ======================================================
+
+ext_pred_binary = clf_full.predict(df_ext_test)
+ext_pred_label = np.where(ext_pred_binary == 1, "Stayed", "Left")
+
+submission = pd.DataFrame({
+    "founder_id": founder_id_test,
+    "retention_status": ext_pred_label
+})
+
+submission.to_csv("submission.csv", index=False)
+
+print("\nsubmission.csv created successfully!")
+print(submission.head())
