@@ -1,0 +1,807 @@
+# ============================================================
+# Libraries and basic setup
+# ============================================================
+import os
+import numpy as np
+import pandas as pd
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import f1_score, classification_report, confusion_matrix
+from sklearn.feature_selection import mutual_info_classif
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV
+
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+
+# For Cramér's V
+try:
+    from scipy.stats import chi2_contingency
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
+
+# Show available files (Kaggle helper)
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+
+# ============================================================
+# Reproducibility
+# ============================================================
+def set_seed(seed: int = 42):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+# ============================================================
+# Feature type declarations (EXPLICIT, not dtype-based)
+# ============================================================
+# Based on your dataset description
+NOMINAL_FEATURES = [
+    "identity_code",
+    "cultural_background",
+    "hobby_engagement_level",
+    "creative_expression_index",
+]
+
+ORDINAL_FEATURES = [
+    "upbringing_influence",
+    "external_guidance_usage",
+    "support_environment_score",
+    "physical_activity_index",
+]
+
+NUMERIC_FEATURES = [
+    "age_group",
+    "focus_intensity",
+    "consistency_score",
+    # "altruism_score"
+]
+
+ID_COLS = ["participant_id"]
+DROP_COLS = ["record_code"]
+TARGET_COL = "personality_cluster"
+
+ALL_FEATURES = NOMINAL_FEATURES + ORDINAL_FEATURES + NUMERIC_FEATURES
+
+# ============================================================
+# Preprocessing
+# ============================================================
+def preprocess_data(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    target_col: str,
+):
+    """
+    Preprocess train and test:
+    - Drop DROP_COLS
+    - Impute ordinal/numeric with median (train-based)
+    - Impute nominal with most frequent value (train-based)
+    """
+    train = train_df.copy()
+    test = test_df.copy()
+
+    # Drop irrelevant columns
+    train.drop(columns=[c for c in DROP_COLS if c in train.columns], inplace=True)
+    test.drop(columns=[c for c in DROP_COLS if c in test.columns], inplace=True)
+
+    # Sanity checks
+    # for col in ALL_FEATURES:
+    #     if col not in train.columns:
+    #         raise ValueError(f"Declared feature '{col}' not found in train data.")
+    #     if col not in test.columns:
+    #         raise ValueError(f"Declared feature '{col}' not found in test data.")
+
+    numeric_like_cols = ORDINAL_FEATURES + NUMERIC_FEATURES
+    categorical_cols = NOMINAL_FEATURES
+
+    # Impute numeric-like (ordinal + numeric) with median
+    if numeric_like_cols:
+        medians = train[numeric_like_cols].median()
+        train[numeric_like_cols] = train[numeric_like_cols].fillna(medians)
+        for col in numeric_like_cols:
+            test[col] = test[col].fillna(medians[col])
+
+    # Impute nominal with most frequent
+    if categorical_cols:
+        modes = train[categorical_cols].mode().iloc[0]
+        for col in categorical_cols:
+            mode_val = modes[col]
+            train[col] = train[col].fillna(mode_val)
+            test[col] = test[col].fillna(mode_val)
+
+    return train, test
+
+# ============================================================
+# Feature engineering hook (same for all models)
+# ============================================================
+def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Feature Engineering Based on Correlation + Mutual Information Insights.
+    Uses ONLY correct feature categories (do not mix them).
+    """
+
+    eps = 1e-6  # to avoid division by zero
+
+    # -----------------------------------------
+    # NEW ENGINEERED FEATURES (ALL NUMERIC)
+    # -----------------------------------------
+
+    # A) Nonlinear interactions of top predictors (focus + consistency)
+    df["stability_load"] = df["consistency_score"] * df["focus_intensity"]
+
+    # B) Ratio: consistency relative to focus
+    df["consistency_focus_ratio"] = df["consistency_score"] / (df["focus_intensity"] + 1)
+
+    # C) Interaction: upbringing × support environment
+    df["upbringing_env_interaction"] = (
+        df["upbringing_influence"] * df["support_environment_score"]
+    )
+
+    # D) Polynomial features
+    df["focus_squared"] = df["focus_intensity"] ** 2
+    df["consistency_squared"] = df["consistency_score"] ** 2
+
+    # E) Binary indicators (median split)
+    df["high_focus"] = (df["focus_intensity"] > df["focus_intensity"].median()).astype(int)
+    df["high_consistency"] = (df["consistency_score"] > df["consistency_score"].median()).astype(int)
+
+    # F) Z-scores
+    df["focus_z"] = (
+        (df["focus_intensity"] - df["focus_intensity"].mean())
+        / (df["focus_intensity"].std() + eps)
+    )
+    df["consistency_z"] = (
+        (df["consistency_score"] - df["consistency_score"].mean())
+        / (df["consistency_score"].std() + eps)
+    )
+
+    return df
+
+# ============================================================
+# EDA helpers
+# ============================================================
+def run_eda(train_df: pd.DataFrame):
+    print("\n========== BASIC INFO ==========")
+    print(train_df.head())
+    print("\nTrain shape:", train_df.shape)
+    print("\nTarget distribution:")
+    print(train_df[TARGET_COL].value_counts())
+
+    # Plot target distribution
+    plt.figure(figsize=(6, 4))
+    sns.countplot(x=TARGET_COL, data=train_df)
+    plt.title("Target (personality_cluster) Distribution")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+    # Nominal features: countplots vs target
+    for col in NOMINAL_FEATURES:
+        if col in train_df.columns:
+            plt.figure(figsize=(6, 4))
+            sns.countplot(x=col, hue=TARGET_COL, data=train_df)
+            plt.title(f"Countplot of {col} by {TARGET_COL}")
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            plt.show()
+
+    # Ordinal & numeric: boxplots vs target
+    for col in ORDINAL_FEATURES + NUMERIC_FEATURES:
+        if col in train_df.columns:
+            plt.figure(figsize=(6, 4))
+            sns.boxplot(y=col, data=train_df)
+            plt.title(f"Boxplot of {col} by {TARGET_COL}")
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            plt.show()
+
+    # Correlation heatmap for ordinal/numeric features
+    num_cols = ORDINAL_FEATURES + NUMERIC_FEATURES
+    if num_cols:
+        # Encode target temporarily as numeric for correlation
+        le = LabelEncoder()
+        y_enc = le.fit_transform(train_df[TARGET_COL])
+        corr_df = train_df[num_cols].copy()
+        corr_df["_target_enc_"] = y_enc
+        corr = corr_df.corr()
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm")
+        plt.title("Correlation Heatmap (ordinal/numeric + encoded target)")
+        plt.tight_layout()
+        plt.show()
+
+# ============================================================
+# Feature–target correlation (Cramér’s V + Pearson)
+# ============================================================
+def compute_feature_target_correlations(
+    df: pd.DataFrame,
+    target_col: str,
+    feature_cols: list,
+) -> pd.DataFrame:
+    """
+    - NOMINAL_FEATURES: Cramér's V with categorical target
+    - ORDINAL/NUMERIC: Pearson correlation with encoded target
+    """
+    results = []
+
+    le_y = LabelEncoder()
+    y_encoded = le_y.fit_transform(df[target_col])
+
+    for col in feature_cols:
+        series = df[col]
+        if col in NOMINAL_FEATURES:
+            # Cramér's V
+            if SCIPY_AVAILABLE:
+                try:
+                    contingency = pd.crosstab(series, df[target_col])
+                    if contingency.size == 0:
+                        v = np.nan
+                    else:
+                        chi2, _, _, _ = chi2_contingency(contingency)
+                        n = contingency.to_numpy().sum()
+                        r, k = contingency.shape
+                        if n == 0 or min(r, k) <= 1:
+                            v = np.nan
+                        else:
+                            v = np.sqrt((chi2 / n) / (min(k - 1, r - 1)))
+                except Exception:
+                    v = np.nan
+            else:
+                v = np.nan
+
+            results.append({
+                "feature": col,
+                "feature_type": "nominal",
+                "metric": "cramers_v",
+                "value": v,
+            })
+
+        else:
+            # Ordinal or numeric: Pearson with encoded target
+            try:
+                mask = series.notna()
+                corr_matrix = np.corrcoef(series[mask], y_encoded[mask])
+                corr = corr_matrix[0, 1]
+            except Exception:
+                corr = np.nan
+
+            results.append({
+                "feature": col,
+                "feature_type": "ordinal/numeric",
+                "metric": "pearson_with_encoded_target",
+                "value": corr,
+            })
+
+    corr_df = pd.DataFrame(results)
+    corr_df.sort_values("value", ascending=False, inplace=True, na_position="last")
+    return corr_df
+
+# ============================================================
+# Mutual Information (all treated as discrete)
+# ============================================================
+def compute_mutual_information(
+    df: pd.DataFrame,
+    target_col: str,
+    feature_cols: list,
+) -> pd.DataFrame:
+    """
+    Compute mutual information between each feature and the categorical target.
+    - All features are treated as discrete (nominal or ordinal).
+    """
+    X = df[feature_cols].copy()
+    y = df[target_col].copy()
+
+    X_encoded = pd.DataFrame(index=X.index)
+    discrete_mask = []
+
+    for col in feature_cols:
+        le = LabelEncoder()
+        X_encoded[col] = le.fit_transform(X[col].astype(str))
+        discrete_mask.append(True)
+
+    y_le = LabelEncoder().fit_transform(y)
+
+    mi_scores = mutual_info_classif(
+        X_encoded,
+        y_le,
+        discrete_features=True,
+        random_state=42,
+    )
+
+    mi_df = pd.DataFrame({
+        "feature": feature_cols,
+        "mutual_information": mi_scores,
+    }).sort_values("mutual_information", ascending=False)
+
+    return mi_df
+
+# ============================================================
+# Shared feature matrix (for SVM, Logistic, NN)
+# ============================================================
+def build_feature_matrix(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feature_cols: list,
+):
+    """
+    - One-hot encode NOMINAL_FEATURES
+    - Keep ORDINAL/NUMERIC as is (integer/float)
+    - Align train/test columns
+    - Standard scale everything (logistic/SVM benefit from this)
+    """
+    X_train_raw = train_df[feature_cols].copy()
+    X_test_raw = test_df[feature_cols].copy()
+
+    # One-hot encode only nominal features
+    X_train_enc = pd.get_dummies(
+        X_train_raw,
+        columns=NOMINAL_FEATURES,
+        drop_first=False,
+    )
+    X_test_enc = pd.get_dummies(
+        X_test_raw,
+        columns=NOMINAL_FEATURES,
+        drop_first=False,
+    )
+
+    # Align columns
+    X_test_enc = X_test_enc.reindex(columns=X_train_enc.columns, fill_value=0)
+
+    feature_names = X_train_enc.columns.tolist()
+
+    # scaler = StandardScaler()
+    # X_train_scaled = scaler.fit_transform(X_train_enc.values)
+    # X_test_scaled = scaler.transform(X_test_enc.values)
+
+    return X_train_enc.values.astype(float), X_test_enc.values.astype(float), feature_names
+
+
+# ============================================================
+# SVM model
+# ============================================================
+
+def train_evaluate_svm(X_train, y_train, X_valid, y_valid):
+    """
+    SVM with GridSearchCV for hyperparameter tuning.
+    Evaluates the best model on the provided validation set.
+    """
+
+    param_grid = {
+        "C": [0.1, 1, 3, 10],
+        "gamma": ["scale", "auto", 0.1, 0.01, 0.001],
+        "kernel": ["rbf"],   # rbf works best for nonlinear tabular
+    }
+
+    svm = SVC(
+        probability=True,
+        class_weight="balanced",
+        random_state=42,
+    )
+
+    grid = GridSearchCV(
+        svm,
+        param_grid,
+        scoring="f1_macro",
+        n_jobs=-1,
+        cv=3,                    # internal 3-fold CV on training split
+        verbose=1,
+    )
+
+    print("\n===== Running GridSearch for SVM =====")
+    grid.fit(X_train, y_train)
+
+    print("\nBest SVM parameters:", grid.best_params_)
+    print("Best CV F1 score:", grid.best_score_)
+
+    # Evaluate on the validation set
+    best_svm = grid.best_estimator_
+    y_pred = best_svm.predict(X_valid)
+
+    macro_f1 = f1_score(y_valid, y_pred, average="macro")
+
+    print("\n===== Tuned SVM Validation Results =====")
+    print(f"Validation Macro F1: {macro_f1:.4f}")
+    print("Classification report:")
+    print(classification_report(y_valid, y_pred))
+    print("Confusion matrix:")
+    print(confusion_matrix(y_valid, y_pred))
+
+    return best_svm, macro_f1
+
+
+
+# ============================================================
+# Logistic Regression model
+# ============================================================
+def train_evaluate_logreg(X_train, y_train, X_valid, y_valid):
+    """
+    Logistic Regression with GridSearch hyperparameter tuning.
+    Evaluates the best model on the validation set.
+    """
+
+    # Base estimator (ignores penalty/solver mismatch errors inside search)
+    base_logreg = LogisticRegression(
+        multi_class="multinomial",
+        max_iter=10000,
+        class_weight="balanced",
+    )
+
+    param_grid = {
+        "C": [0.01, 0.1, 1, 3, 10],
+        "solver": ["lbfgs", "saga"],     # saga supports l1/l2
+        "penalty": ["l2"],               # multinomial + saga/lbfgs require L2
+    }
+
+    grid = GridSearchCV(
+        base_logreg,
+        param_grid,
+        scoring="f1_macro",
+        cv=3,
+        verbose=1,
+        n_jobs=-1,
+    )
+
+    print("\n===== Running GridSearch for Logistic Regression =====")
+    grid.fit(X_train, y_train)
+
+    print("\nBest LogReg parameters:", grid.best_params_)
+    print("Best CV Macro F1:", grid.best_score_)
+
+    # Evaluate on validation split
+    best_logreg = grid.best_estimator_
+    y_pred = best_logreg.predict(X_valid)
+    macro_f1 = f1_score(y_valid, y_pred, average="macro")
+
+    print("\n===== Tuned Logistic Regression Validation Results =====")
+    print(f"Validation Macro F1 (LogReg): {macro_f1:.4f}")
+    print("Classification report (LogReg):")
+    print(classification_report(y_valid, y_pred))
+    print("Confusion matrix (LogReg):")
+    print(confusion_matrix(y_valid, y_pred))
+
+    return best_logreg, macro_f1
+
+
+# ============================================================
+# PyTorch NN model
+# ============================================================
+class TabularNN(nn.Module):
+    def __init__(self, input_dim: int, num_classes: int, hidden_dims=(128, 64), dropout=0.2):
+        super().__init__()
+        layers = []
+        prev_dim = input_dim
+        for h in hidden_dims:
+            layers.append(nn.Linear(prev_dim, h))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            prev_dim = h
+        layers.append(nn.Linear(prev_dim, num_classes))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def train_evaluate_nn(
+    X_train,
+    y_train,
+    X_valid,
+    y_valid,
+    num_classes: int,
+    epochs: int = 50,
+    batch_size: int = 256,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    X_train_t = torch.tensor(X_train, dtype=torch.float32)
+    y_train_t = torch.tensor(y_train, dtype=torch.long)
+    X_valid_t = torch.tensor(X_valid, dtype=torch.float32)
+    y_valid_t = torch.tensor(y_valid, dtype=torch.long)
+
+    train_ds = TensorDataset(X_train_t, y_train_t)
+    valid_ds = TensorDataset(X_valid_t, y_valid_t)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_ds, batch_size=batch_size, shuffle=False)
+
+    model = TabularNN(input_dim=X_train.shape[1], num_classes=num_classes).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best_val_f1 = -np.inf
+    best_state = None
+    patience = 10
+    patience_counter = 0
+
+    for epoch in range(1, epochs + 1):
+        # Train
+        model.train()
+        total_loss = 0.0
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item() * xb.size(0)
+
+        avg_train_loss = total_loss / len(train_loader.dataset)
+
+        # Validate
+        model.eval()
+        all_preds = []
+        all_true = []
+        val_loss = 0.0
+        with torch.no_grad():
+            for xb, yb in valid_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+                logits = model(xb)
+                loss = criterion(logits, yb)
+                val_loss += loss.item() * xb.size(0)
+
+                preds = torch.argmax(logits, dim=1)
+                all_preds.append(preds.cpu().numpy())
+                all_true.append(yb.cpu().numpy())
+
+        all_preds = np.concatenate(all_preds)
+        all_true = np.concatenate(all_true)
+        avg_val_loss = val_loss / len(valid_loader.dataset)
+        val_f1 = f1_score(all_true, all_preds, average="macro")
+
+        print(
+            f"Epoch {epoch:03d} | Train Loss: {avg_train_loss:.4f} "
+            f"| Val Loss: {avg_val_loss:.4f} | Val Macro F1: {val_f1:.4f}"
+        )
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            best_state = model.state_dict()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("Early stopping triggered.")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    print("\n===== NN Validation Results =====")
+    print(f"Best Macro F1 (NN): {best_val_f1:.4f}")
+    model.eval()
+    with torch.no_grad():
+        logits = model(X_valid_t.to(device))
+        preds = torch.argmax(logits, dim=1).cpu().numpy()
+    print("Classification report (NN):")
+    print(classification_report(y_valid, preds))
+    print("Confusion matrix (NN):")
+    print(confusion_matrix(y_valid, preds))
+
+    return model, best_val_f1
+
+
+def nn_predict(model: nn.Module, X: np.ndarray) -> np.ndarray:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+    X_t = torch.tensor(X, dtype=torch.float32).to(device)
+    with torch.no_grad():
+        logits = model(X_t)
+        preds = torch.argmax(logits, dim=1).cpu().numpy()
+    return preds
+
+def tune_and_train_nn(
+    X_train,
+    y_train,
+    X_valid,
+    y_valid,
+    num_classes,
+):
+    search_space = [
+        {"hidden_dims": (128, 64), "dropout": 0.2, "lr": 1e-3, "weight_decay": 1e-4},
+        {"hidden_dims": (256, 128), "dropout": 0.3, "lr": 5e-4, "weight_decay": 1e-5},
+        {"hidden_dims": (64, 32), "dropout": 0.1, "lr": 1e-3, "weight_decay": 1e-4},
+        {"hidden_dims": (128, 128), "dropout": 0.4, "lr": 1e-4, "weight_decay": 1e-4},
+    ]
+
+    best_f1 = -np.inf
+    best_model = None
+    best_params = None
+
+    for params in search_space:
+        print("\nTrying params:", params)
+
+        model, val_f1 = train_evaluate_nn(
+            X_train=X_train,
+            y_train=y_train,
+            X_valid=X_valid,
+            y_valid=y_valid,
+            num_classes=num_classes,
+            epochs=60,
+            batch_size=256,
+            lr=params["lr"],
+            weight_decay=params["weight_decay"],
+        )
+
+        if val_f1 > best_f1:
+            best_f1 = val_f1
+            best_model = model
+            best_params = params
+
+    print("\n===== Best NN Hyperparameters =====")
+    print(best_params)
+    print("Best Validation Macro F1:", best_f1)
+
+    return best_model, best_f1
+
+
+
+# ============================================================
+# Main
+# ============================================================
+def main():
+    set_seed(42)
+
+    train_path = "/kaggle/input/multidimensional-personality-cluster-prediction/train.csv"
+    test_path = "/kaggle/input/multidimensional-personality-cluster-prediction/test.csv"
+
+    if not os.path.exists(train_path):
+        raise FileNotFoundError(f"Could not find {train_path}")
+    if not os.path.exists(test_path):
+        raise FileNotFoundError(f"Could not find {test_path}")
+
+    print(f"Loading data from {train_path} and {test_path} ...")
+    train_df = pd.read_csv(train_path)
+    test_df = pd.read_csv(test_path)
+
+    # Preprocess
+    print("\n========== Preprocessing ==========")
+    train_proc, test_proc = preprocess_data(
+        train_df=train_df,
+        test_df=test_df,
+        target_col=TARGET_COL,
+    )
+
+    NUMERIC_FEATURES = [
+        "age_group",
+        "focus_intensity",
+        "consistency_score",
+    
+        # ENGINEERED FEATURES
+        # "stability_load",
+        # "consistency_focus_ratio",
+        # "upbringing_env_interaction",
+    ]
+    ALL_FEATURES = NOMINAL_FEATURES + ORDINAL_FEATURES + NUMERIC_FEATURES
+    # Feature engineering
+    print("\n========== Feature Engineering ==========")
+    train_fe = feature_engineering(train_proc.copy())
+    test_fe = feature_engineering(test_proc.copy())
+
+    # EDA
+    print("\n========== EDA ==========")
+    run_eda(train_fe)
+
+    # Feature analysis: correlations
+    print("\n========== Feature–Target Correlation Analysis ==========")
+    corr_df = compute_feature_target_correlations(
+        df=train_fe,
+        target_col=TARGET_COL,
+        feature_cols=ALL_FEATURES,
+    )
+    print(corr_df)
+
+    # Mutual Information
+    print("\n========== Mutual Information Analysis ==========")
+    mi_df = compute_mutual_information(
+        df=train_fe,
+        target_col=TARGET_COL,
+        feature_cols=ALL_FEATURES,
+    )
+    print(mi_df)
+
+    # Encode target
+    y = train_fe[TARGET_COL].values
+    le_target = LabelEncoder()
+    y_enc = le_target.fit_transform(y)
+    num_classes = len(le_target.classes_)
+    print(f"\nTarget classes ({num_classes}): {list(le_target.classes_)}")
+
+    # Build shared feature matrix
+    print("\n========== Building Feature Matrix (shared for all models) ==========")
+    X_all, X_test_all, encoded_feature_names = build_feature_matrix(
+        train_df=train_fe,
+        test_df=test_fe,
+        feature_cols=ALL_FEATURES,
+    )
+    print(f"Encoded feature dimension: {X_all.shape[1]}")
+
+    # Train/validation split
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_all,
+        y_enc,
+        test_size=0.2,
+        random_state=42,
+        stratify=y_enc,
+    )
+
+    # Train & evaluate SVM
+    svm_model, svm_f1 = train_evaluate_svm(X_tr, y_tr, X_val, y_val)
+
+    # Train & evaluate Logistic Regression
+    logreg_model, logreg_f1 = train_evaluate_logreg(X_tr, y_tr, X_val, y_val)
+
+    # Train & evaluate NN
+    nn_model, nn_f1 = tune_and_train_nn(
+        X_tr,
+        y_tr,
+        X_val,
+        y_val,
+        num_classes=num_classes
+    )
+
+    # Model comparison
+    print("\n========== Model Comparison ==========")
+    print(f"SVM   Macro F1: {svm_f1:.4f}")
+    print(f"LogReg Macro F1: {logreg_f1:.4f}")
+    print(f"NN    Macro F1: {nn_f1:.4f}")
+
+    scores = {
+        "svm": svm_f1,
+        "logreg": logreg_f1,
+        "nn": nn_f1,
+    }
+    best_model_name = max(scores, key=scores.get)
+    print(f"Selected model: {best_model_name.upper()}")
+
+    # best_model_name = "svm"
+    # IMPORTANT: Use validation-trained model directly (NO full retrain → avoids overfitting)
+    print("\n========== Using Validation-Trained Model for Final Predictions ==========")
+
+    if best_model_name == "svm":
+        final_model = svm_model
+        test_pred_enc = final_model.predict(X_test_all)
+
+    elif best_model_name == "logreg":
+        final_model = logreg_model
+        test_pred_enc = final_model.predict(X_test_all)
+
+    else:
+        final_model = nn_model
+        test_pred_enc = nn_predict(final_model, X_test_all)
+
+    # Decode predictions and write submission
+    test_pred_labels = le_target.inverse_transform(test_pred_enc)
+    if "participant_id" not in test_df.columns:
+        raise ValueError("Expected 'participant_id' column in test.csv for submission.")
+
+    submission = pd.DataFrame({
+        "participant_id": test_df["participant_id"],
+        "personality_cluster": test_pred_labels,
+    })
+    submission.to_csv("submission.csv", index=False)
+    print("\nSubmission file written to submission.csv")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
