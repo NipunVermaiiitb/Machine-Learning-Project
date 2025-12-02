@@ -654,6 +654,85 @@ def tune_and_train_nn(
     return best_model, best_f1
 
 
+# ============================================================
+# SVM + NN Stratified K-Fold Evaluation (Trained on only 20% of train.csv)
+# ============================================================
+
+from sklearn.model_selection import StratifiedKFold
+
+def evaluate_models_kfold_20pct(X_all, y_all, num_classes, k=5):
+
+    print("\n========== Stratified K-Fold (20% Training) for SVM & NN ==========")
+
+    skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=42)
+
+    svm_scores = []
+    nn_scores = []
+
+    fold = 1
+    for train_idx, val_idx in skf.split(X_all, y_all):
+
+        print(f"\n----- Fold {fold} -----")
+
+        # =======================
+        # 20% TRAIN SUBSET only
+        # =======================
+        full_train_X = X_all[train_idx]
+        full_train_y = y_all[train_idx]
+
+        # Randomly take only 20% of this fold's training set
+        X_20, _, y_20, _ = train_test_split(
+            full_train_X,
+            full_train_y,
+            test_size=0.8,
+            stratify=full_train_y,
+            random_state=fold
+        )
+
+        X_val = X_all[val_idx]
+        y_val = y_all[val_idx]
+
+        # --------------------------
+        # 1) SVM (No grid search here)
+        # --------------------------
+        svm = SVC(
+            kernel="rbf",
+            C=1.0,
+            gamma="scale",
+            class_weight="balanced",
+            random_state=42,
+        )
+        svm.fit(X_20, y_20)
+        pred = svm.predict(X_val)
+        f1 = f1_score(y_val, pred, average="macro")
+        svm_scores.append(f1)
+        print(f"SVM Macro F1 Fold {fold}: {f1:.4f}")
+
+        # --------------------------
+        # 2) Neural Network
+        # --------------------------
+        nn_model, nn_f1 = train_evaluate_nn(
+            X_train=X_20,
+            y_train=y_20,
+            X_valid=X_val,
+            y_valid=y_val,
+            num_classes=num_classes,
+            epochs=25,       # fewer epochs for CV
+            batch_size=256,
+            lr=1e-3,
+            weight_decay=1e-4
+        )
+
+        nn_scores.append(nn_f1)
+        print(f"NN  Macro F1 Fold {fold}: {nn_f1:.4f}")
+
+        fold += 1
+
+    print("\n========== FINAL K-FOLD RESULTS (20% Training) ==========")
+    print(f"SVM Macro-F1: Mean={np.mean(svm_scores):.4f}, Std={np.std(svm_scores):.4f}")
+    print(f"NN  Macro-F1: Mean={np.mean(nn_scores):.4f}, Std={np.std(nn_scores):.4f}")
+
+    return svm_scores, nn_scores
 
 # ============================================================
 # Main
@@ -734,6 +813,13 @@ def main():
         feature_cols=ALL_FEATURES,
     )
     print(f"Encoded feature dimension: {X_all.shape[1]}")
+    # ===== Run Stratified K-Fold (20% training) for SVM + NN =====
+evaluate_models_kfold_20pct(
+    X_all=X_all,
+    y_all=y_enc,
+    num_classes=num_classes,
+    k=5
+)
 
     # Train/validation split
     X_tr, X_val, y_tr, y_val = train_test_split(
